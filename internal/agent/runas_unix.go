@@ -22,6 +22,10 @@ func configureProcessGroup(cmd *exec.Cmd) {
 	}
 	cmd.SysProcAttr.Setpgid = true
 	cmd.Cancel = func() error {
+		// Guard against a cancel that races process startup (Process nil).
+		if cmd.Process == nil {
+			return nil
+		}
 		// Negative pid → signal the process group.
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}

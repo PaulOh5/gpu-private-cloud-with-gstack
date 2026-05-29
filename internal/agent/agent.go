@@ -121,6 +121,11 @@ func (a *Agent) execute(ctx context.Context, job types.Job, workdir string) {
 		a.mu.Lock()
 		delete(a.running, job.ID)
 		a.mu.Unlock()
+		// Reclaim the staged workdir now that the job is done — otherwise every
+		// job's unpacked tar would accumulate on the provider's disk.
+		if a.Stager != nil {
+			a.Stager.Cleanup(job.ID)
+		}
 	}()
 
 	a.Control.ReportStatus(ctx, job.ID, types.JobRunning, 0)

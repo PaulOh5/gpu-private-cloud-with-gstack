@@ -15,6 +15,9 @@ import (
 type Stager interface {
 	// Dir returns the staged directory for jobID and whether it is ready.
 	Dir(jobID string) (dir string, ready bool)
+	// Cleanup removes a finished job's staged directory. Called by the agent
+	// once the job reaches a terminal state so workdirs don't pile up on disk.
+	Cleanup(jobID string)
 }
 
 // WorkdirStager receives client tar uploads (data plane, P2P) and unpacks each
@@ -71,8 +74,12 @@ func (s *WorkdirStager) Handler() http.Handler {
 			return
 		}
 		s.mu.Lock()
+		old := s.dirs[jobID] // a re-upload replaces the prior staging
 		s.dirs[jobID] = dir
 		s.mu.Unlock()
+		if old != "" {
+			os.RemoveAll(old)
+		}
 		w.WriteHeader(http.StatusNoContent)
 	})
 	return mux

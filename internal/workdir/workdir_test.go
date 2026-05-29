@@ -75,6 +75,32 @@ func TestUntarRejectsAbsolutePath(t *testing.T) {
 	}
 }
 
+// TestUntarSkipsSymlinks: link entries are dropped, not extracted, to close the
+// symlink-then-write escape class (adversarial #9).
+func TestUntarSkipsSymlinks(t *testing.T) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	// A regular file, then a symlink pointing at the repo root.
+	body := []byte("real\n")
+	tw.WriteHeader(&tar.Header{Name: "ok.txt", Mode: 0o644, Size: int64(len(body)), Typeflag: tar.TypeReg})
+	tw.Write(body)
+	tw.WriteHeader(&tar.Header{Name: "escape", Linkname: "/etc", Typeflag: tar.TypeSymlink})
+	tw.Close()
+	gz.Close()
+
+	dst := t.TempDir()
+	if err := Untar(&buf, dst); err != nil {
+		t.Fatalf("Untar: %v", err)
+	}
+	if readFile(t, filepath.Join(dst, "ok.txt")) != "real\n" {
+		t.Error("regular file should still extract")
+	}
+	if _, err := os.Lstat(filepath.Join(dst, "escape")); !os.IsNotExist(err) {
+		t.Error("symlink entry should have been skipped, not created")
+	}
+}
+
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

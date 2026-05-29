@@ -232,17 +232,40 @@ func (c *Coordinator) handleLogs(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// handleCancel: client requests cancellation; the owning agent picks it up via
-// its cancels poll.
+// handleCancel: client requests cancellation.
+//
+// A running job is handed to its agent (which kills the process and reports
+// killed). A job that is only queued or assigned has no live process yet, so
+// the coordinator kills it directly and frees its GPU — otherwise a pre-start
+// cancel would be silently ignored and the reserved GPU stranded.
 func (c *Coordinator) handleCancel(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if err := c.store.RequestCancel(r.Context(), id); err != nil {
-		if errors.Is(err, store.ErrJobNotFound) {
-			writeErr(w, http.StatusNotFound, "job not found")
-			return
-		}
+	job, err := c.store.GetJob(r.Context(), id)
+	if errors.Is(err, store.ErrJobNotFound) {
+		writeErr(w, http.StatusNotFound, "job not found")
+		return
+	}
+	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if job.State.IsTerminal() {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "already finished"})
+		return
+	}
+
+	// Always flag it so an agent that has it running stops the process.
+	if err := c.store.RequestCancel(r.Context(), id); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// Not yet running on an agent → kill directly and release the GPU.
+	if job.State == types.JobQueued || job.State == types.JobAssigned {
+		if err := c.store.SetJobStatus(r.Context(), id, types.JobKilled, -1, c.now()); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		c.hub.finish(id, types.JobKilled, -1)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "cancel requested"})
 }
@@ -273,6 +296,21 @@ func (c *Coordinator) handleLogStream(w http.ResponseWriter, r *http.Request) {
 
 	if sub.Done {
 		writeSSE(w, "done", map[string]any{"state": sub.State, "exit_code": sub.Exit})
+		flusher.Flush()
+		return
+	}
+
+	// The hub has no terminal record. That can mean the job is still running —
+	// OR that the hub never saw it finish (coordinator restarted and lost its
+	// in-memory log state). Consult the store: if the job is already terminal
+	// (or unknown), emit done now instead of blocking on a channel that will
+	// never receive. Without this, `flex logs`/`flex run` hang forever.
+	if job, err := c.store.GetJob(r.Context(), id); err != nil || job.State.IsTerminal() {
+		state, exit := types.JobFailed, -1
+		if err == nil {
+			state, exit = job.State, job.ExitCode
+		}
+		writeSSE(w, "done", map[string]any{"state": state, "exit_code": exit})
 		flusher.Flush()
 		return
 	}

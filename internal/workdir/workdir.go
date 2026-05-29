@@ -122,15 +122,13 @@ func Untar(r io.Reader, destDir string) error {
 			if err := os.MkdirAll(target, 0o755); err != nil {
 				return err
 			}
-		case tar.TypeSymlink:
-			// Only allow symlinks that resolve within destDir.
-			if _, err := safeJoin(cleanDest, filepath.Join(filepath.Dir(hdr.Name), hdr.Linkname)); err != nil {
-				return fmt.Errorf("refusing symlink escaping workdir: %s -> %s", hdr.Name, hdr.Linkname)
-			}
-			os.MkdirAll(filepath.Dir(target), 0o755)
-			if err := os.Symlink(hdr.Linkname, target); err != nil {
-				return err
-			}
+		case tar.TypeSymlink, tar.TypeLink:
+			// Skip links entirely. A symlink created earlier in the archive can
+			// redirect a later regular-file write outside destDir (symlink
+			// TOCTOU) even when each entry's lexical path passes safeJoin. Code
+			// workdirs rarely need links, so dropping them closes the escape
+			// class outright rather than trying to validate it.
+			continue
 		case tar.TypeReg:
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
