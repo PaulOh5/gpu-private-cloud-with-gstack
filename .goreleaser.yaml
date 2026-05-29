@@ -1,0 +1,50 @@
+# goreleaser config for flex. Pure-Go (modernc sqlite) → CGO_ENABLED=0, so a
+# single workflow cross-compiles every target without C toolchains.
+# Build locally with `goreleaser release --snapshot --clean`.
+version: 2
+
+project_name: flex
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: flex
+    main: ./cmd/flex
+    binary: flex
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      # GPU providers are Linux; macOS support is for the client CLI on Apple
+      # silicon. Skip the Intel-mac build to match the distribution plan.
+      - goos: darwin
+        goarch: amd64
+
+archives:
+  - id: flex
+    formats: [tar.gz]
+    # Matches install.sh: flex_<version>_<os>_<arch>.tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  draft: false
