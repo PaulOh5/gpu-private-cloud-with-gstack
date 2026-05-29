@@ -21,6 +21,9 @@ import (
 	"strings"
 )
 
+// version is overridden at release time via -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -43,6 +46,9 @@ func main() {
 		err = runLogs(args)
 	case "cancel":
 		err = runCancel(args)
+	case "version", "--version", "-v":
+		fmt.Printf("flex %s\n", version)
+		return
 	case "-h", "--help", "help":
 		usage()
 		return
