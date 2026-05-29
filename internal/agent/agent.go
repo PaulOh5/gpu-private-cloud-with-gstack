@@ -126,10 +126,11 @@ func (a *Agent) execute(ctx context.Context, job types.Job, workdir string) {
 	a.Control.ReportStatus(ctx, job.ID, types.JobRunning, 0)
 
 	res, err := RunJob(ctx, RunSpec{
-		Command:   job.Command,
-		EnvSetup:  job.EnvSetup,
-		WorkDir:   workdir,
-		RunAsUser: a.RunAsUser,
+		Command:    job.Command,
+		EnvSetup:   job.EnvSetup,
+		WorkDir:    workdir,
+		RunAsUser:  a.RunAsUser,
+		GPUIndexes: job.GPUIndexes,
 	}, func(ch LogChunk) {
 		// Best-effort; a dropped log chunk must not crash the job.
 		a.Control.AppendLogs(context.WithoutCancel(ctx), job.ID, []LogChunk{ch})

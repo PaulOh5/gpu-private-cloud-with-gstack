@@ -21,7 +21,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,10 +37,11 @@ type LogChunk = types.LogChunk
 
 // RunSpec describes one job execution.
 type RunSpec struct {
-	Command   []string // argv; Command[0] is the program
-	EnvSetup  string   // optional shell run before Command (e.g. "source .venv/bin/activate")
-	WorkDir   string   // directory to run in (the unpacked workdir tar)
-	RunAsUser string   // if set and we are root, drop to this unprivileged user
+	Command    []string // argv; Command[0] is the program
+	EnvSetup   string   // optional shell run before Command (e.g. "source .venv/bin/activate")
+	WorkDir    string   // directory to run in (the unpacked workdir tar)
+	RunAsUser  string   // if set and we are root, drop to this unprivileged user
+	GPUIndexes []int    // assigned GPU indexes; pins the job via CUDA_VISIBLE_DEVICES
 }
 
 // Result is the outcome of a job run.
@@ -64,6 +68,7 @@ func RunJob(ctx context.Context, spec RunSpec, onLogs func(LogChunk)) (Result, e
 
 	cmd := buildCmd(ctx, spec)
 	cmd.Dir = spec.WorkDir
+	cmd.Env = jobEnv(spec.GPUIndexes)
 	configureProcessGroup(cmd)
 	if spec.RunAsUser != "" {
 		if err := setRunAsUser(cmd, spec.RunAsUser); err != nil {
@@ -119,6 +124,24 @@ func buildCmd(ctx context.Context, spec RunSpec) *exec.Cmd {
 	}
 	args := append([]string{"-c", spec.EnvSetup + `; exec "$@"`, "flex"}, spec.Command...)
 	return exec.CommandContext(ctx, "sh", args...)
+}
+
+// jobEnv returns the child environment: the agent's own env plus the GPU pin.
+// Setting CUDA_VISIBLE_DEVICES to the assigned indexes is what makes the
+// scheduler's assignment real — without it a CUDA job sees every GPU and
+// defaults to device 0, so two jobs would collide on one card. NVIDIA_VISIBLE_
+// DEVICES is set too for container runtimes (nvidia-docker) that honor it.
+func jobEnv(indexes []int) []string {
+	env := os.Environ()
+	if len(indexes) == 0 {
+		return env
+	}
+	parts := make([]string, len(indexes))
+	for i, idx := range indexes {
+		parts[i] = strconv.Itoa(idx)
+	}
+	list := strings.Join(parts, ",")
+	return append(env, "CUDA_VISIBLE_DEVICES="+list, "NVIDIA_VISIBLE_DEVICES="+list)
 }
 
 // pump reads r line-by-line and feeds the batcher, tagging the stream.

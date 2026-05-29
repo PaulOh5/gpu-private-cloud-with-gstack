@@ -118,6 +118,37 @@ func TestRunJobCancel(t *testing.T) {
 	}
 }
 
+func TestRunJobPinsGPUs(t *testing.T) {
+	skipNonUnix(t)
+	c := &collector{}
+	_, err := RunJob(context.Background(), RunSpec{
+		Command:    []string{"sh", "-c", "echo $CUDA_VISIBLE_DEVICES"},
+		GPUIndexes: []int{1, 3},
+	}, c.onLogs)
+	if err != nil {
+		t.Fatalf("RunJob: %v", err)
+	}
+	if got := strings.TrimSpace(c.stdout.String()); got != "1,3" {
+		t.Errorf("CUDA_VISIBLE_DEVICES = %q, want '1,3'", got)
+	}
+}
+
+func TestRunJobNoPinWhenNoGPUs(t *testing.T) {
+	skipNonUnix(t)
+	c := &collector{}
+	_, err := RunJob(context.Background(), RunSpec{
+		Command: []string{"sh", "-c", "echo [${CUDA_VISIBLE_DEVICES-unset}]"},
+	}, c.onLogs)
+	if err != nil {
+		t.Fatalf("RunJob: %v", err)
+	}
+	// With no assigned GPUs we must not inject the var (don't hide host GPUs
+	// from a job the scheduler didn't pin).
+	if got := strings.TrimSpace(c.stdout.String()); got != "[unset]" {
+		t.Errorf("CUDA_VISIBLE_DEVICES = %q, want '[unset]'", got)
+	}
+}
+
 func TestRunJobEmptyCommand(t *testing.T) {
 	_, err := RunJob(context.Background(), RunSpec{}, func(LogChunk) {})
 	if err == nil {
