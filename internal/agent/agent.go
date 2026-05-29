@@ -37,9 +37,10 @@ type Agent struct {
 	Interval  time.Duration // poll/heartbeat cadence
 	RunAsUser string        // unprivileged user to run jobs as (provider safety)
 
-	// WorkDirFor returns the staged workdir for a job (the unpacked client tar).
-	// nil runs jobs in the agent's cwd — the actual tar receive is wired in T5.
-	WorkDirFor func(jobID string) (string, error)
+	// Stager resolves the staged workdir (unpacked client tar) for a job. When
+	// set, a job only starts once its workdir has been received. When nil, jobs
+	// run in the agent's cwd (used by tests with self-contained commands).
+	Stager Stager
 
 	mu      sync.Mutex
 	running map[string]context.CancelFunc // jobID -> cancel
@@ -90,8 +91,19 @@ func (a *Agent) tick(ctx context.Context) {
 	}
 }
 
-// startJob launches a job if it is not already running.
+// startJob launches a job if it is not already running and its workdir is
+// staged. If the Stager doesn't have the workdir yet (client tar still in
+// flight), it returns without starting — the next poll retries.
 func (a *Agent) startJob(parent context.Context, job types.Job) {
+	workdir := ""
+	if a.Stager != nil {
+		d, ready := a.Stager.Dir(job.ID)
+		if !ready {
+			return // wait for the client→agent tar upload
+		}
+		workdir = d
+	}
+
 	a.mu.Lock()
 	if _, ok := a.running[job.ID]; ok {
 		a.mu.Unlock()
@@ -101,26 +113,15 @@ func (a *Agent) startJob(parent context.Context, job types.Job) {
 	a.running[job.ID] = cancel
 	a.mu.Unlock()
 
-	go a.execute(jobCtx, job)
+	go a.execute(jobCtx, job, workdir)
 }
 
-func (a *Agent) execute(ctx context.Context, job types.Job) {
+func (a *Agent) execute(ctx context.Context, job types.Job, workdir string) {
 	defer func() {
 		a.mu.Lock()
 		delete(a.running, job.ID)
 		a.mu.Unlock()
 	}()
-
-	workdir := ""
-	if a.WorkDirFor != nil {
-		d, err := a.WorkDirFor(job.ID)
-		if err != nil {
-			a.Control.ReportStatus(ctx, job.ID, types.JobFailed, -1)
-			a.Control.AppendLogs(ctx, job.ID, []LogChunk{{Stream: "stderr", Data: "flex: staging workdir failed: " + err.Error() + "\n"}})
-			return
-		}
-		workdir = d
-	}
 
 	a.Control.ReportStatus(ctx, job.ID, types.JobRunning, 0)
 

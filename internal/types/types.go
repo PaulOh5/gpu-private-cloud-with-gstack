@@ -10,6 +10,13 @@ import (
 	"time"
 )
 
+// LogChunk is a batch of job output as it flows agent → coordinator → client.
+// Stream is "stdout" or "stderr".
+type LogChunk struct {
+	Stream string `json:"stream"`
+	Data   string `json:"data"`
+}
+
 // Role distinguishes how a machine participates in the pool. The two roles are
 // decoupled: a GPU-less laptop is a pure client, a GPU box runs an agent and is
 // a provider, and a machine can be both.

@@ -24,13 +24,13 @@ import (
 	"os/exec"
 	"sync"
 	"time"
+
+	"github.com/PaulOh5/gpu-private-cloud-with-gstack/internal/types"
 )
 
-// LogChunk is a batch of job output. Stream is "stdout" or "stderr".
-type LogChunk struct {
-	Stream string `json:"stream"`
-	Data   string `json:"data"`
-}
+// LogChunk is the shared output-batch type, aliased here for convenience within
+// the agent (agent produces, coordinator relays, client consumes).
+type LogChunk = types.LogChunk
 
 // RunSpec describes one job execution.
 type RunSpec struct {

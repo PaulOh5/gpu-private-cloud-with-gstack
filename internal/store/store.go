@@ -98,12 +98,13 @@ CREATE TABLE IF NOT EXISTS jobs (
   env_setup   TEXT NOT NULL,
   spec        TEXT NOT NULL,  -- JSON types.GPUSpec
   vram_min_mb INTEGER NOT NULL,
-  state       TEXT NOT NULL,
-  node_id     TEXT NOT NULL DEFAULT '',
-  gpu_indexes TEXT NOT NULL DEFAULT '[]',  -- JSON []int
-  exit_code   INTEGER NOT NULL DEFAULT 0,
-  created_at  INTEGER NOT NULL,
-  updated_at  INTEGER NOT NULL
+  state            TEXT NOT NULL,
+  node_id          TEXT NOT NULL DEFAULT '',
+  gpu_indexes      TEXT NOT NULL DEFAULT '[]',  -- JSON []int
+  exit_code        INTEGER NOT NULL DEFAULT 0,
+  cancel_requested INTEGER NOT NULL DEFAULT 0,  -- 1 = client asked to cancel
+  created_at       INTEGER NOT NULL,
+  updated_at       INTEGER NOT NULL
 );`
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("migrate: %w", err)
@@ -225,6 +226,87 @@ func (s *Store) SubmitJob(ctx context.Context, j types.Job) error {
 // GetJob loads a job by id.
 func (s *Store) GetJob(ctx context.Context, id string) (types.Job, error) {
 	return scanJob(s.db.QueryRowContext(ctx, jobCols+` FROM jobs WHERE id = ?`, id))
+}
+
+// ListAssigned returns jobs assigned to a node that have not started yet
+// (state == assigned). The agent polls this to pick up new work.
+func (s *Store) ListAssigned(ctx context.Context, nodeID string) ([]types.Job, error) {
+	rows, err := s.db.QueryContext(ctx, jobCols+` FROM jobs WHERE node_id = ? AND state = ? ORDER BY created_at`,
+		nodeID, string(types.JobAssigned))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []types.Job
+	for rows.Next() {
+		j, err := scanJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
+// ListCancels returns IDs of a node's jobs the client asked to cancel and that
+// are still live (assigned or running). The agent polls this to kill them.
+func (s *Store) ListCancels(ctx context.Context, nodeID string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id FROM jobs WHERE node_id = ? AND cancel_requested = 1 AND state IN (?, ?)`,
+		nodeID, string(types.JobAssigned), string(types.JobRunning))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// SetJobStatus updates a job's state and (for terminal states) exit code. When
+// the job reaches a terminal state its GPUs are returned to the pool by
+// clearing the assignment ledger — this is how finished jobs free capacity.
+func (s *Store) SetJobStatus(ctx context.Context, jobID string, state types.JobState, exitCode int, now time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	res, err := tx.ExecContext(ctx,
+		`UPDATE jobs SET state = ?, exit_code = ?, updated_at = ? WHERE id = ?`,
+		string(state), exitCode, now.Unix(), jobID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrJobNotFound
+	}
+	if state.IsTerminal() {
+		if _, err := tx.ExecContext(ctx, `UPDATE gpus SET assigned_job = '' WHERE assigned_job = ?`, jobID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// RequestCancel marks a job for cancellation. The agent owning it will see this
+// via ListCancels on its next poll and kill the process.
+func (s *Store) RequestCancel(ctx context.Context, jobID string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE jobs SET cancel_requested = 1 WHERE id = ?`, jobID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrJobNotFound
+	}
+	return nil
 }
 
 // Assign reserves GPUs for a queued job inside a BEGIN IMMEDIATE transaction.

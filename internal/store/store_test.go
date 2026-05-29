@@ -165,6 +165,74 @@ func TestReRegisterPreservesAssignment(t *testing.T) {
 	}
 }
 
+func TestSetJobStatusTerminalFreesGPU(t *testing.T) {
+	s := openTest(t)
+	provider(t, s, "office-a", "NVIDIA GeForce RTX 4090")
+	queueJob(t, s, "job1", types.GPUSpec{AnyModel: true, Count: 1})
+	if _, err := s.Assign(context.Background(), "job1", fixedNow, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	// While running, GPU is busy.
+	if err := s.SetJobStatus(context.Background(), "job1", types.JobRunning, 0, fixedNow); err != nil {
+		t.Fatal(err)
+	}
+	gpus, _ := s.ListGPUs(context.Background())
+	if gpus[0].Free {
+		t.Fatal("GPU should still be busy while running")
+	}
+	// On terminal, the GPU returns to the pool.
+	if err := s.SetJobStatus(context.Background(), "job1", types.JobSucceeded, 0, fixedNow); err != nil {
+		t.Fatal(err)
+	}
+	gpus, _ = s.ListGPUs(context.Background())
+	if !gpus[0].Free {
+		t.Fatal("GPU should be free after the job succeeds")
+	}
+	job, _ := s.GetJob(context.Background(), "job1")
+	if job.State != types.JobSucceeded || job.ExitCode != 0 {
+		t.Fatalf("job = %+v", job)
+	}
+}
+
+func TestListAssignedAndCancels(t *testing.T) {
+	s := openTest(t)
+	provider(t, s, "office-a", "NVIDIA GeForce RTX 4090")
+	queueJob(t, s, "job1", types.GPUSpec{AnyModel: true, Count: 1})
+	if _, err := s.Assign(context.Background(), "job1", fixedNow, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	assigned, err := s.ListAssigned(context.Background(), "office-a")
+	if err != nil || len(assigned) != 1 || assigned[0].ID != "job1" {
+		t.Fatalf("ListAssigned = %+v, err=%v", assigned, err)
+	}
+
+	// No cancels yet.
+	if ids, _ := s.ListCancels(context.Background(), "office-a"); len(ids) != 0 {
+		t.Fatalf("ListCancels = %v, want empty", ids)
+	}
+	// Request cancel → appears for the owning node.
+	if err := s.RequestCancel(context.Background(), "job1"); err != nil {
+		t.Fatal(err)
+	}
+	ids, _ := s.ListCancels(context.Background(), "office-a")
+	if len(ids) != 1 || ids[0] != "job1" {
+		t.Fatalf("ListCancels = %v, want [job1]", ids)
+	}
+	// Once terminal, it no longer shows as a pending cancel.
+	s.SetJobStatus(context.Background(), "job1", types.JobKilled, -1, fixedNow)
+	if ids, _ := s.ListCancels(context.Background(), "office-a"); len(ids) != 0 {
+		t.Fatalf("ListCancels after kill = %v, want empty", ids)
+	}
+}
+
+func TestSetJobStatusUnknownJob(t *testing.T) {
+	s := openTest(t)
+	if err := s.SetJobStatus(context.Background(), "ghost", types.JobRunning, 0, fixedNow); !errors.Is(err, ErrJobNotFound) {
+		t.Fatalf("err = %v, want ErrJobNotFound", err)
+	}
+}
+
 func TestMultiGPUJobLandsOnOneNode(t *testing.T) {
 	s := openTest(t)
 	provider(t, s, "office-a", "NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 4090")

@@ -26,6 +26,7 @@ import (
 // Coordinator holds the dependencies shared by the handlers.
 type Coordinator struct {
 	store      *store.Store
+	hub        *logHub
 	now        func() time.Time
 	liveWithin time.Duration // a provider missing heartbeats this long is not assignable
 }
@@ -42,16 +43,24 @@ func WithLiveWithin(d time.Duration) Option { return func(c *Coordinator) { c.li
 
 // New builds a Coordinator and returns it together with its HTTP handler.
 func New(s *store.Store, opts ...Option) (*Coordinator, http.Handler) {
-	c := &Coordinator{store: s, now: time.Now, liveWithin: 30 * time.Second}
+	c := &Coordinator{store: s, hub: newLogHub(1024), now: time.Now, liveWithin: 30 * time.Second}
 	for _, o := range opts {
 		o(c)
 	}
 	mux := http.NewServeMux()
+	// Client / control plane.
 	mux.HandleFunc("POST /register", c.handleRegister)
 	mux.HandleFunc("POST /heartbeat", c.handleHeartbeat)
 	mux.HandleFunc("GET /gpus", c.handleGPUs)
 	mux.HandleFunc("POST /jobs", c.handleSubmit)
 	mux.HandleFunc("GET /jobs/{id}", c.handleGetJob)
+	mux.HandleFunc("POST /jobs/{id}/cancel", c.handleCancel)
+	mux.HandleFunc("GET /jobs/{id}/logs/stream", c.handleLogStream)
+	// Agent plane (pull): agents poll for work and report back.
+	mux.HandleFunc("GET /agents/{node}/assigned", c.handleAssigned)
+	mux.HandleFunc("GET /agents/{node}/cancels", c.handleCancels)
+	mux.HandleFunc("POST /jobs/{id}/status", c.handleStatus)
+	mux.HandleFunc("POST /jobs/{id}/logs", c.handleLogs)
 	return c, mux
 }
 
@@ -158,6 +167,141 @@ func (c *Coordinator) handleGetJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, job)
+}
+
+// handleAssigned: agent pulls jobs assigned to it that haven't started.
+func (c *Coordinator) handleAssigned(w http.ResponseWriter, r *http.Request) {
+	jobs, err := c.store.ListAssigned(r.Context(), r.PathValue("node"))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if jobs == nil {
+		jobs = []types.Job{}
+	}
+	writeJSON(w, http.StatusOK, jobs)
+}
+
+// handleCancels: agent pulls IDs of its jobs the client asked to cancel.
+func (c *Coordinator) handleCancels(w http.ResponseWriter, r *http.Request) {
+	ids, err := c.store.ListCancels(r.Context(), r.PathValue("node"))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if ids == nil {
+		ids = []string{}
+	}
+	writeJSON(w, http.StatusOK, ids)
+}
+
+// handleStatus: agent reports a job's state (+exit code on terminal). Terminal
+// states free the job's GPUs (in the store) and close its log streams (hub).
+func (c *Coordinator) handleStatus(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var body struct {
+		State    types.JobState `json:"state"`
+		ExitCode int            `json:"exit_code"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	if err := c.store.SetJobStatus(r.Context(), id, body.State, body.ExitCode, c.now()); err != nil {
+		if errors.Is(err, store.ErrJobNotFound) {
+			writeErr(w, http.StatusNotFound, "job not found")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if body.State.IsTerminal() {
+		c.hub.finish(id, body.State, body.ExitCode)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleLogs: agent POSTs a batch of log chunks; the hub fans them out to SSE
+// subscribers and keeps a bounded backlog.
+func (c *Coordinator) handleLogs(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var chunks []types.LogChunk
+	if !decode(w, r, &chunks) {
+		return
+	}
+	c.hub.append(id, chunks)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleCancel: client requests cancellation; the owning agent picks it up via
+// its cancels poll.
+func (c *Coordinator) handleCancel(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := c.store.RequestCancel(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrJobNotFound) {
+			writeErr(w, http.StatusNotFound, "job not found")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "cancel requested"})
+}
+
+// handleLogStream streams a job's logs to the client over SSE: backlog first,
+// then live chunks, then a final "done" event carrying the terminal state and
+// exit code. Clients (`flex run`, `flex logs`) reconnect here after a drop —
+// the backlog ring replays what they missed.
+func (c *Coordinator) handleLogStream(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeErr(w, http.StatusInternalServerError, "streaming unsupported")
+		return
+	}
+	id := r.PathValue("id")
+	sub := c.hub.subscribe(id)
+	defer sub.cancel()
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+
+	for _, ch := range sub.Backlog {
+		writeSSE(w, "log", ch)
+	}
+	flusher.Flush()
+
+	if sub.Done {
+		writeSSE(w, "done", map[string]any{"state": sub.State, "exit_code": sub.Exit})
+		flusher.Flush()
+		return
+	}
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return // client disconnected
+		case ch, open := <-sub.Live:
+			if !open {
+				done, state, exit := c.hub.status(id)
+				if done {
+					writeSSE(w, "done", map[string]any{"state": state, "exit_code": exit})
+					flusher.Flush()
+				}
+				return
+			}
+			writeSSE(w, "log", ch)
+			flusher.Flush()
+		}
+	}
+}
+
+// writeSSE writes one Server-Sent Event with a JSON data payload.
+func writeSSE(w http.ResponseWriter, event string, payload any) {
+	b, _ := json.Marshal(payload)
+	w.Write([]byte("event: " + event + "\ndata: "))
+	w.Write(b)
+	w.Write([]byte("\n\n"))
 }
 
 // decode reads a JSON body into v, writing a 400 and returning false on failure.
